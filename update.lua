@@ -1,11 +1,20 @@
 local repo = "somestuds/cctweaked-cache"
-local url
+local root_url = "https://api.github.com/repos/" .. repo .. "/contents"
 local computer_id = tostring(os.getComputerID())
+local filename = string.sub(debug.getinfo(1, "S").short_src, 2, -1)
+local url
 
 local sha256CachePath = "./sha.bin"
 local sha256Cache = {}
-local computerRootSha256 = ""
+local computerRootSha256
 local computerRootSha256Index = "rootSha256_" .. computer_id
+
+local function printWithColor(color, ...)
+    local old = term.getTextColor()
+    term.setTextColor(color)
+    print(...)
+    term.setTextColor(old)
+end
 
 if fs.exists(sha256CachePath) then
     local file = fs.open(sha256CachePath, "r")
@@ -62,21 +71,27 @@ local function handleHttpSuccess()
     repeat
         _, http_url, handle = os.pullEvent("http_success")
     until http_url == url
+
     local data = handle.readAll()
     local json = textutils.unserialiseJSON(data)
     assert(json, "Invalid JSON returned from Github API")
     assert(not (json.status and json.status == "404"), "No files found for this computer (" .. computer_id .. ")")
-
+    json = json.tree
     local serverNodes = {}
     local unmergedSha256Cache = {}
 
+    local pathBlacklist = table.concat({ "rom", filename, "sha.bin", "" }, ";")
     local function getInstalledPaths(base)
         local tbl = {}
         for _, path in pairs(fs.list(base or "")) do
-            tbl[path] = true
-            if fs.isDir(path) then
-                for subpath, _ in pairs(getInstalledPaths(path)) do
-                    tbl[subpath] = true
+            os.sleep(0)
+            if string.find(pathBlacklist, path .. ";") == nil then
+                tbl[path] = true
+                if fs.isDir(path) then
+                    for subpath, _ in pairs(getInstalledPaths(path)) do
+                        os.sleep(0)
+                        tbl[subpath] = true
+                    end
                 end
             end
         end
@@ -84,19 +99,22 @@ local function handleHttpSuccess()
     end
 
     for _, node in pairs(json) do
-        ---@type "dir"|"file"
+        os.sleep(0)
+        ---@type "tree"|"blob"
         local type = node.type
 
-        local path = node.path.split(computer_id .. "/")[2]
+        local path = node.path
         local sha256 = node.sha
 
         serverNodes[path] = true
 
         local nodeExists = fs.exists(path)
         if not nodeExists or sha256 ~= sha256Cache[path] then
-            if type == "dir" and not nodeExists then fs.makeDir(path) end
-            if type == "file" then
-                local download_url = node.download_url
+            printWithColor(colors.yellow, "<O> Updating@ " .. path)
+            if type == "tree" and not nodeExists then fs.makeDir(path) end
+            if type == "blob" then
+                local download_url = "https://raw.githubusercontent.com/" .. repo .. "/main/" .. computer_id .. "/" ..
+                    path
                 if nodeExists then fs.delete(path) end
 
                 local req = http.get(download_url)
@@ -110,10 +128,13 @@ local function handleHttpSuccess()
                 writeStream.close()
             end
             unmergedSha256Cache[path] = sha256
+        else
+            printWithColor(colors.green, "<=> Up-To-Date@ " .. path)
         end
     end
 
     for path, _ in pairs(getInstalledPaths("")) do
+        os.sleep(0)
         if not serverNodes[path] then
             fs.delete(path)
             unmergedSha256Cache[path] = ""
@@ -121,6 +142,7 @@ local function handleHttpSuccess()
     end
 
     writeSha256Cache(unmergedSha256Cache)
+    error("Successfully updated all!", 0)
 end
 
 local function handleHttpError()
@@ -133,10 +155,10 @@ local function handleHttpError()
 end
 
 parallel.waitForAll(
+    handleHttpError, handleHttpSuccess,
     function()
         if not computerRootSha256 then
-            local rootUrl = textutils.urlEncode("https://api.github.com/repos/" .. repo .. "/contents")
-            local response = http.get(rootUrl)
+            local response = http.get(root_url)
             assert(response, "Computer Folder Tree sha256 was nil and could not contact Github API to obtain it")
 
             local data = response.readAll()
@@ -147,6 +169,7 @@ parallel.waitForAll(
                 "Repository is invalid or private, could not obtain computer root sha256")
 
             for _, node in pairs(json) do
+                os.sleep(0)
                 if node.type == "dir" and node.path == computer_id and node.name == computer_id then
                     computerRootSha256 = node.sha
                     writeSha256Cache({ [computerRootSha256Index] = computerRootSha256 })
@@ -155,9 +178,8 @@ parallel.waitForAll(
         end
         assert(computerRootSha256, "Could not obtain tree root sha256 for Computer ID")
 
-        url = textutils.urlEncode("https://api.github.com/repos/" ..
-            repo .. "/git/trees/" .. computerRootSha256 .. "?recursive=1")
+        url = "https://api.github.com/repos/" ..
+            repo .. "/git/trees/" .. computerRootSha256 .. "?recursive=1"
         http.request(url)
-    end,
-    parallel.waitForAny(handleHttpError, handleHttpSuccess)
+    end
 )
